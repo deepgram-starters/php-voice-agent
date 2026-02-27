@@ -335,7 +335,7 @@ class HttpHandler implements \Ratchet\Http\HttpServerInterface
      * @param ConnectionInterface $conn The HTTP connection
      * @param \Psr\Http\Message\RequestInterface|null $request The HTTP request
      */
-    public function onOpen(ConnectionInterface $conn, \Psr\Http\Message\RequestInterface $request = null)
+    public function onOpen(ConnectionInterface $conn, ?\Psr\Http\Message\RequestInterface $request = null)
     {
         $path = $request ? $request->getUri()->getPath() : '/';
         $method = $request ? $request->getMethod() : 'GET';
@@ -475,17 +475,44 @@ class HttpHandler implements \Ratchet\Http\HttpServerInterface
 // SERVER BOOTSTRAP
 // ============================================================================
 
-$loop = Loop::get();
-
 // Set up routing
-$voiceAgentProxy = new VoiceAgentProxy($loop, $config);
+$voiceAgentProxy = new VoiceAgentProxy(Loop::get(), $config);
 $httpHandler = new HttpHandler($config);
+
+// WebSocket handler with custom negotiator for access_token.* subprotocols
+$wsServer = new WsServer($voiceAgentProxy);
+
+// Ratchet's WsServer rejects dynamic subprotocols by default.
+// Install a custom ServerNegotiator that accepts access_token.* protocols.
+$customNegotiator = new class(new \Ratchet\RFC6455\Handshake\RequestVerifier()) extends \Ratchet\RFC6455\Handshake\ServerNegotiator {
+    public function __construct(\Ratchet\RFC6455\Handshake\RequestVerifier $verifier) {
+        parent::__construct($verifier);
+        $this->setStrictSubProtocolCheck(false);
+    }
+    public function handshake(\Psr\Http\Message\RequestInterface $request): \Psr\Http\Message\ResponseInterface {
+        $response = parent::handshake($request);
+        if ($response->getStatusCode() === 101 && !$response->hasHeader('Sec-WebSocket-Protocol')) {
+            $protocols = $request->getHeader('Sec-WebSocket-Protocol');
+            $all = array_map('trim', explode(',', implode(',', $protocols)));
+            foreach ($all as $proto) {
+                if (str_starts_with($proto, 'access_token.')) {
+                    $response = $response->withHeader('Sec-WebSocket-Protocol', $proto);
+                    break;
+                }
+            }
+        }
+        return $response;
+    }
+};
+$ref = new \ReflectionProperty($wsServer, 'handshakeNegotiator');
+$ref->setAccessible(true);
+$ref->setValue($wsServer, $customNegotiator);
 
 $routes = new RouteCollection();
 
 // WebSocket route for voice agent proxy
 $routes->add('voice-agent', new Route('/api/voice-agent', [
-    '_controller' => new WsServer($voiceAgentProxy),
+    '_controller' => $wsServer,
 ], [], [], '', [], ['GET']));
 
 // HTTP routes for session and metadata
@@ -510,11 +537,29 @@ $routes->add('fallback', new Route('/{path}', [
 $urlMatcher = new UrlMatcher($routes, new RequestContext());
 $router = new Router($urlMatcher);
 
-$server = new IoServer(
-    new HttpServer($router),
-    new \React\Socket\SocketServer("{$config['host']}:{$config['port']}", [], $loop),
-    $loop
-);
+$PORT = $config['port'];
+$HOST = $config['host'];
+
+// Use the shared Loop::get() singleton so outbound WebSocket connections
+// (Deepgram proxy) run on the same loop as the server.
+// IoServer::factory() creates a separate loop via LoopFactory::create() which
+// would prevent the Deepgram connector's promises from resolving.
+$loop = \React\EventLoop\Loop::get();
+$socket = new \React\Socket\SocketServer("{$HOST}:{$PORT}", [], $loop);
+$server = new IoServer(new HttpServer($router), $socket, $loop);
+
+// Graceful shutdown on SIGINT/SIGTERM
+if (function_exists('pcntl_signal')) {
+    $shutdownHandler = function (int $signal) use ($server) {
+        echo "\nShutting down server...\n";
+        $server->socket->close();
+        $server->loop->addTimer(1, function () use ($server) {
+            $server->loop->stop();
+        });
+    };
+    $server->loop->addSignal(SIGTERM, $shutdownHandler);
+    $server->loop->addSignal(SIGINT, $shutdownHandler);
+}
 
 // ============================================================================
 // STARTUP
